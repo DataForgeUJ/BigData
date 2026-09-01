@@ -1,0 +1,54 @@
+seed: 42
+
+data:
+  root: data/raw
+  processed_dir: data/processed
+  splits_dir: data/splits
+  embeddings_dir: data/embeddings
+  image_size: 224
+
+model:
+  backbone: resnet50
+  pretrained: imagenet
+  embedding_dim: 512
+  normalize_embeddings: true
+
+training:
+  batch_size: 64
+  epochs: 30
+  learning_rate: 0.0001
+  loss: triplet
+  margin: 0.3
+
+retrieval:
+  top_k: 5
+  gallery_fractions: [0.25, 0.50, 0.75, 1.00]
+  exact:
+    metric: cosine
+  lsh:
+    num_bits: 16
+    num_tables: 10
+  hnsw:
+    space: cosine
+    M: 16
+    ef_construction: 200
+    ef_search: 100
+
+open_set:
+  threshold: null
+  tune_on: validation
+
+evaluation:
+  metrics:
+    - top1
+    - top5
+    - baks
+    - auroc
+    - baus
+    - recall_at_k
+    - avg_latency_ms
+    - p95_latency_ms
+    - qps
+    - comparisons
+    - index_build_time_s
+    - index_size_mb

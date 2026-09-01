@@ -1,0 +1,26 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+.DS_Store
+
+# Large/local data
+data/raw/*
+data/processed/*
+data/embeddings/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/embeddings/.gitkeep
+
+# Generated artifacts
+artifacts/checkpoints/*
+artifacts/indexes/*
+artifacts/results/*
+artifacts/logs/*
+!artifacts/checkpoints/.gitkeep
+!artifacts/indexes/.gitkeep
+!artifacts/results/.gitkeep
+!artifacts/logs/.gitkeep
