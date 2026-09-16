@@ -1,5 +1,22 @@
-"""ResNet-50 based embedding model.
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50, ResNet50_Weights
 
-Implementation milestone: replace the classifier with an embedding head and
-train only on the official WildlifeReID-10k training partition.
-"""
+
+class EmbeddingModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Load ResNet-50
+        self.model = resnet50(weights=ResNet50_Weights.DEFAULT)
+
+        # Remove the classification layer
+        self.model.fc = nn.Identity()
+
+    def forward(self, images):
+        embeddings = self.model(images)
+
+        # Normalize embeddings for cosine similarity
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+
+        return embeddings
