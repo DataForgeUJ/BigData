@@ -10,7 +10,7 @@ data:
 model:
   backbone: resnet50
   pretrained: imagenet
-  embedding_dim: 512
+  embedding_dim: 2048
   normalize_embeddings: true
 
 training:
