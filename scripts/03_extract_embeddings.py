@@ -1,5 +1,6 @@
-"""Extract 2048-D embeddings using a frozen ImageNet-pretrained ResNet-50."""
+"""Extract embeddings using frozen or fine-tuned ResNet-50."""
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -16,20 +17,69 @@ from src.data.dataset import load_dataset, get_transform, WildlifeDataset
 
 BATCH_SIZE = 16
 
+CHECKPOINT_PATH = Path(
+    "artifacts/checkpoints/best_resnet50.pth"
+)
 
-def create_model(device):
-    """Create a frozen ImageNet-pretrained ResNet-50."""
 
-    print("Loading ImageNet-pretrained ResNet-50...")
+def create_model(device, mode):
+    """Create the ResNet-50 model."""
 
-    model = resnet50(weights=ResNet50_Weights.DEFAULT)
+    print()
+    print("Creating ResNet-50...")
+    print("Mode:", mode)
+
+    if mode == "frozen":
+
+        print("Using ImageNet-pretrained weights.")
+
+        model = resnet50(
+            weights=ResNet50_Weights.DEFAULT
+        )
+
+    elif mode == "finetuned":
+
+        if not CHECKPOINT_PATH.exists():
+            raise FileNotFoundError(
+                "\nFine-tuned checkpoint was not found:\n"
+                f"{CHECKPOINT_PATH}\n\n"
+                "Run scripts/02_train_model.py first "
+                "to create best_resnet50.pth."
+            )
+
+        print(
+            "Loading fine-tuned checkpoint:"
+        )
+        print(CHECKPOINT_PATH)
+
+        model = resnet50(
+            weights=None
+        )
+
+    else:
+        raise ValueError(
+            "Mode must be 'frozen' or 'finetuned'."
+        )
 
     # Remove the classification layer.
     model.fc = torch.nn.Identity()
 
+    # Load fine-tuned weights if required.
+    if mode == "finetuned":
+
+        state_dict = torch.load(
+            CHECKPOINT_PATH,
+            map_location=device,
+            weights_only=True
+        )
+
+        model.load_state_dict(state_dict)
+
+        print("Fine-tuned weights loaded successfully.")
+
     model = model.to(device)
 
-    # Freeze all model parameters.
+    # Embedding extraction does not require gradients.
     for parameter in model.parameters():
         parameter.requires_grad = False
 
@@ -38,8 +88,12 @@ def create_model(device):
     return model
 
 
-def extract_embeddings(model, data_loader, device):
-    """Extract embeddings for all images in a DataLoader."""
+def extract_embeddings(
+    model,
+    data_loader,
+    device
+):
+    """Extract 2048-dimensional embeddings."""
 
     model.eval()
 
@@ -47,20 +101,40 @@ def extract_embeddings(model, data_loader, device):
     metadata = []
 
     with torch.no_grad():
-        for batch_number, batch in enumerate(data_loader, start=1):
 
-            images = batch["image"].to(device)
+        for batch_number, batch in enumerate(
+            data_loader,
+            start=1
+        ):
 
-            # Generate 2048-D embeddings.
+            images = batch["image"].to(
+                device,
+                non_blocking=True
+            )
+
+            # Generate 2048-dimensional embeddings.
             batch_embeddings = model(images)
 
-            # Move embeddings to CPU.
-            batch_embeddings = batch_embeddings.cpu().numpy()
+            # Explicit L2 normalization.
+            # This makes cosine similarity equivalent
+            # to the dot product.
+            batch_embeddings = torch.nn.functional.normalize(
+                batch_embeddings,
+                p=2,
+                dim=1
+            )
+
+            batch_embeddings = (
+                batch_embeddings
+                .cpu()
+                .numpy()
+            )
 
             embeddings.append(batch_embeddings)
 
             # Store metadata.
             for i in range(len(batch["identity"])):
+
                 metadata.append({
                     "identity": batch["identity"][i],
                     "species": batch["species"][i],
@@ -68,73 +142,199 @@ def extract_embeddings(model, data_loader, device):
                 })
 
             if batch_number % 100 == 0:
-                print("Processed batches:", batch_number)
 
-    embeddings = np.concatenate(embeddings, axis=0)
+                print(
+                    "Processed batches:",
+                    batch_number,
+                    "/",
+                    len(data_loader)
+                )
+
+    embeddings = np.concatenate(
+        embeddings,
+        axis=0
+    )
 
     return embeddings, metadata
 
 
-def save_embeddings(embeddings, metadata, output_dir, name):
-    """Save embeddings and metadata."""
+def save_embeddings(
+    embeddings,
+    metadata,
+    output_dir,
+    name
+):
+    """Save embeddings and corresponding metadata."""
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    embedding_file = output_dir / f"{name}_embeddings.npy"
-    metadata_file = output_dir / f"{name}_metadata.csv"
+    embedding_file = (
+        output_dir /
+        f"{name}_embeddings.npy"
+    )
 
-    np.save(embedding_file, embeddings)
+    metadata_file = (
+        output_dir /
+        f"{name}_metadata.csv"
+    )
 
-    metadata_df = pd.DataFrame(metadata)
-    metadata_df.to_csv(metadata_file, index=False)
+    np.save(
+        embedding_file,
+        embeddings
+    )
 
-    print("Saved:", embedding_file)
-    print("Saved:", metadata_file)
-    print("Shape:", embeddings.shape)
+    metadata_df = pd.DataFrame(
+        metadata
+    )
+
+    metadata_df.to_csv(
+        metadata_file,
+        index=False
+    )
+
+    print()
+    print("Saved embeddings:")
+    print(embedding_file)
+
+    print("Saved metadata:")
+    print(metadata_file)
+
+    print("Embedding shape:")
+    print(embeddings.shape)
+
+
+def parse_arguments():
+    """Read command-line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract ResNet-50 embeddings "
+            "using frozen or fine-tuned weights."
+        )
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "frozen",
+            "finetuned"
+        ],
+        default="frozen",
+        help=(
+            "Embedding model to use: "
+            "frozen or finetuned."
+        )
+    )
+
+    return parser.parse_args()
 
 
 def main():
 
-    train_file = Path("data/processed/train.csv")
-    validation_file = Path("data/processed/validation.csv")
-    test_file = Path("data/processed/test.csv")
+    args = parse_arguments()
 
-    dataset_dir = Path("data/raw")
-    output_dir = Path("data/embeddings")
+    mode = args.mode
 
-    # Use GPU if available, otherwise CPU.
+    # ----------------------------------------
+    # Paths
+    # ----------------------------------------
+
+    train_file = Path(
+        "data/processed/train.csv"
+    )
+
+    validation_file = Path(
+        "data/processed/validation.csv"
+    )
+
+    test_file = Path(
+        "data/processed/test.csv"
+    )
+
+    dataset_dir = Path(
+        "data/raw"
+    )
+
+    # Store frozen and fine-tuned embeddings
+    # separately.
+    output_dir = (
+        Path("data/embeddings") /
+        mode
+    )
+
+    # ----------------------------------------
+    # Device
+    # ----------------------------------------
+
     if torch.cuda.is_available():
+
         device = torch.device("cuda")
+
     else:
+
         device = torch.device("cpu")
 
     print()
-    print("---- Embedding Extraction ----")
+    print("========================================")
+    print("ResNet-50 Embedding Extraction")
+    print("========================================")
+
+    print("Mode:", mode)
     print("Device:", device)
     print("Batch size:", BATCH_SIZE)
 
     if device.type == "cuda":
-        print("GPU:", torch.cuda.get_device_name(0))
 
-    # Load frozen ResNet-50.
-    model = create_model(device)
+        print(
+            "GPU:",
+            torch.cuda.get_device_name(0)
+        )
 
     print("Embedding dimension: 2048")
 
+    # ----------------------------------------
+    # Create model
+    # ----------------------------------------
+
+    model = create_model(
+        device,
+        mode
+    )
+
+    # ----------------------------------------
+    # Image transformation
+    # ----------------------------------------
+
     transform = get_transform()
 
+    # ----------------------------------------
+    # Process datasets
+    # ----------------------------------------
+
     datasets = [
-        ("train", train_file),
-        ("validation", validation_file),
-        ("test", test_file)
+        (
+            "train",
+            train_file
+        ),
+        (
+            "validation",
+            validation_file
+        ),
+        (
+            "test",
+            test_file
+        )
     ]
 
     for name, metadata_file in datasets:
 
         print()
-        print("------------------------------")
+        print("----------------------------------------")
         print("Processing:", name)
-        print("------------------------------")
+        print("----------------------------------------")
 
         records = load_dataset(
             metadata_file,
@@ -142,7 +342,10 @@ def main():
             name
         )
 
-        print("Images:", len(records))
+        print(
+            "Images:",
+            len(records)
+        )
 
         dataset = WildlifeDataset(
             records,
@@ -153,7 +356,8 @@ def main():
             dataset,
             batch_size=BATCH_SIZE,
             shuffle=False,
-            num_workers=0
+            num_workers=0,
+            pin_memory=(device.type == "cuda")
         )
 
         embeddings, metadata = extract_embeddings(
@@ -170,8 +374,14 @@ def main():
         )
 
     print()
-    print("---- Embedding extraction complete ----")
+    print("========================================")
+    print("Embedding extraction complete")
+    print("========================================")
+
+    print("Mode:", mode)
+    print("Output directory:", output_dir)
 
 
 if __name__ == "__main__":
     main()
+
