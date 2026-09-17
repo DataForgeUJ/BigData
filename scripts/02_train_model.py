@@ -1,8 +1,13 @@
 # Fine-tunes ResNet-50 using triplet loss
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import random
 import torch
 import torch.nn as nn
-from pathlib import Path
 from torch.utils.data import DataLoader
 from src.data.dataset import load_dataset, get_transform, TripletDataset
 from src.models.embedding_model import EmbeddingModel
