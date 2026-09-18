@@ -9,6 +9,7 @@ __pycache__/
 
 # Large/local data
 data/raw/*
+!data/raw/metadata.csv
 data/processed/*
 data/embeddings/*
 !data/raw/.gitkeep
