@@ -8,330 +8,214 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import hnswlib
 import numpy as np
 import pandas as pd
 import yaml
 
+from src.retrieval.hnsw import build_index as build_hnsw_index
+from src.retrieval.lsh import RandomHyperplaneLSH
 
-# ============================================================
-# Configuration
-# ============================================================
 
 CONFIG_PATH = Path("configs/base.yaml")
-INDEX_DIR = Path("artifacts/indexes")
+INDEX_ROOT = Path("artifacts/indexes")
 
+config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+SEED = config.get("seed", 42)
+DATA_CFG = config["data"]
+MODEL_CFG = config["model"]
+RETRIEVAL_CFG = config["retrieval"]
 
-# ============================================================
-# Helpers
-# ============================================================
-
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def load_embeddings(embedding_dir):
-    embeddings = np.load(embedding_dir / "train_embeddings.npy")
-    metadata = pd.read_csv(embedding_dir / "train_metadata.csv")
-
-    if len(embeddings) != len(metadata):
-        raise ValueError(
-            f"Embedding/metadata mismatch: "
-            f"{len(embeddings)} embeddings vs {len(metadata)} metadata rows"
-        )
-
-    return embeddings.astype(np.float32), metadata
+EMBEDDING_MODE = DATA_CFG.get("embedding_mode", "finetuned")
+EMBEDDING_ROOT = Path(DATA_CFG["embeddings_dir"]) / EMBEDDING_MODE
 
 
 def normalize_embeddings(embeddings):
+    embeddings = np.asarray(embeddings, dtype=np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     return embeddings / np.maximum(norms, 1e-12)
 
 
-def create_gallery_subset(embeddings, metadata, fraction, seed):
-    rng = np.random.default_rng(seed)
-    indices = rng.permutation(len(embeddings))[:int(len(embeddings) * fraction)]
+def load_embeddings(name):
+    path = EMBEDDING_ROOT / f"{name}_embeddings.npy"
 
-    return embeddings[indices], metadata.iloc[indices].reset_index(drop=True), indices
+    if not path.exists():
+        raise FileNotFoundError(f"Embedding file not found: {path}")
 
-
-def save_exact_gallery(gallery_dir, embeddings, metadata):
-    exact_dir = gallery_dir / "exact"
-    exact_dir.mkdir(parents=True, exist_ok=True)
-
-    np.save(exact_dir / "gallery_embeddings.npy", embeddings)
-    metadata.to_csv(exact_dir / "gallery_metadata.csv", index=False)
+    return normalize_embeddings(np.load(path))
 
 
-# ============================================================
-# Random Hyperplane LSH
-# ============================================================
+def load_metadata(name):
+    path = EMBEDDING_ROOT / f"{name}_metadata.csv"
 
-class RandomHyperplaneLSH:
-    def __init__(self, dim, num_bits, num_tables, seed=42):
-        self.dim = dim
-        self.num_bits = num_bits
-        self.num_tables = num_tables
-        self.seed = seed
-        self.tables = []
-        self.planes = []
+    if not path.exists():
+        raise FileNotFoundError(f"Metadata file not found: {path}")
 
-        rng = np.random.default_rng(seed)
-
-        for _ in range(num_tables):
-            plane = np.zeros((num_bits, dim), dtype=np.float32)
-
-            for bit in range(num_bits):
-                dims = rng.choice(dim, size=min(32, dim), replace=False)
-                values = rng.normal(size=len(dims)).astype(np.float32)
-                plane[bit, dims] = values
-
-            self.planes.append(plane)
-            self.tables.append({})
-
-    def _hash_vectors(self, vectors, plane):
-        projections = vectors @ plane.T
-        bits = (projections >= 0).astype(np.uint32)
-
-        codes = np.zeros(len(vectors), dtype=np.uint32)
-
-        for bit in range(self.num_bits):
-            codes |= bits[:, bit] << bit
-
-        return codes
-
-    def fit(self, embeddings):
-        self.tables = [{} for _ in range(self.num_tables)]
-
-        for table_id, plane in enumerate(self.planes):
-            codes = self._hash_vectors(embeddings, plane)
-
-            for index, code in enumerate(codes):
-                code = int(code)
-                self.tables[table_id].setdefault(code, []).append(index)
-
-            print(
-                f"    LSH table {table_id + 1}: "
-                f"{len(self.tables[table_id])} buckets"
-            )
-
-    def query_candidates(self, query):
-        candidates = set()
-
-        for table_id, plane in enumerate(self.planes):
-            code = int(self._hash_vectors(query[None], plane)[0])
-            candidates.update(self.tables[table_id].get(code, []))
-
-        return np.array(sorted(candidates), dtype=np.int64)
+    return pd.read_csv(path)
 
 
-# ============================================================
-# HNSW
-# ============================================================
-
-def build_hnsw_index(
-    embeddings,
-    output_path,
-    space,
-    M,
-    ef_construction,
-    ef_search,
-):
-    index = hnswlib.Index(space=space, dim=embeddings.shape[1])
-
-    index.init_index(
-        max_elements=len(embeddings),
-        ef_construction=ef_construction,
-        M=M,
-    )
-
-    index.add_items(
-        embeddings,
-        np.arange(len(embeddings)),
-    )
-
-    index.set_ef(ef_search)
-    index.save_index(str(output_path))
-
-    return index
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-    config = load_config()
-
-    seed = config["seed"]
-    data_cfg = config["data"]
-    model_cfg = config["model"]
-    retrieval_cfg = config["retrieval"]
-
-    embedding_mode = data_cfg.get("embedding_mode", "finetuned")
-    embedding_dir = Path(data_cfg["embeddings_dir"]) / embedding_mode
-    index_root = INDEX_DIR / embedding_mode
-
-    fractions = retrieval_cfg["gallery_fractions"]
-
-    lsh_cfg = retrieval_cfg["lsh"]
-    hnsw_cfg = retrieval_cfg["hnsw"]
-
-    print("=" * 60)
-    print("STEP 04: BUILD RETRIEVAL INDEXES")
-    print("=" * 60)
-    print(f"Embedding mode : {embedding_mode}")
-    print(f"Embedding dim  : {model_cfg['embedding_dim']}")
-    print(f"Seed            : {seed}")
-    print(f"Gallery sizes   : {fractions}")
-    print()
-
-    embeddings, metadata = load_embeddings(embedding_dir)
-
-    if embeddings.shape[1] != model_cfg["embedding_dim"]:
-        raise ValueError(
-            f"Expected embedding dimension "
-            f"{model_cfg['embedding_dim']}, "
-            f"got {embeddings.shape[1]}"
-        )
-
-    if model_cfg.get("normalize_embeddings", True):
-        embeddings = normalize_embeddings(embeddings)
-
-    print(f"Loaded {len(embeddings):,} training embeddings")
-    print(f"Dimension: {embeddings.shape[1]}")
-    print()
-
-    rng = np.random.default_rng(seed)
-    all_indices = rng.permutation(len(embeddings))
+def create_gallery_subsets(embeddings, metadata, fractions):
+    rng = np.random.default_rng(SEED)
+    permutation = rng.permutation(len(embeddings))
+    subsets = {}
 
     for fraction in fractions:
-        gallery_size = int(len(embeddings) * fraction)
+        size = int(len(embeddings) * fraction)
+        indices = permutation[:size]
+        subsets[fraction] = indices
 
-        selected_indices = all_indices[:gallery_size]
+    return subsets
 
-        gallery_embeddings = embeddings[selected_indices]
-        gallery_metadata = metadata.iloc[selected_indices].reset_index(drop=True)
 
-        gallery_dir = index_root / f"gallery_{int(fraction * 100)}"
-        gallery_dir.mkdir(parents=True, exist_ok=True)
+def build_lsh(gallery, output_path):
+    lsh_cfg = RETRIEVAL_CFG["lsh"]
 
-        print("-" * 60)
-        print(
-            f"Gallery {fraction:.0%}: "
-            f"{gallery_size:,} / {len(embeddings):,}"
-        )
+    lsh = RandomHyperplaneLSH(
+        dim=gallery.shape[1],
+        num_bits=int(lsh_cfg["num_bits"]),
+        num_tables=int(lsh_cfg["num_tables"]),
+        seed=SEED,
+    )
 
-        # ----------------------------------------------------
-        # Save selected indices
-        # ----------------------------------------------------
+    start = time.perf_counter()
+    lsh.fit(gallery)
+    build_time = time.perf_counter() - start
 
-        np.save(
-            gallery_dir / "selected_indices.npy",
-            selected_indices,
-        )
+    with open(output_path, "wb") as f:
+        pickle.dump(lsh, f)
 
-        # ----------------------------------------------------
-        # Exact Search
-        # ----------------------------------------------------
+    return build_time
 
-        save_exact_gallery(
-            gallery_dir,
-            gallery_embeddings,
-            gallery_metadata,
-        )
 
-        # ----------------------------------------------------
-        # LSH
-        # ----------------------------------------------------
+def build_hnsw(gallery, output_path):
+    hnsw_cfg = RETRIEVAL_CFG["hnsw"]
 
+    start = time.perf_counter()
+
+    build_hnsw_index(
+        gallery,
+        output_path,
+        hnsw_cfg["space"],
+        int(hnsw_cfg["M"]),
+        int(hnsw_cfg["ef_construction"]),
+        int(hnsw_cfg["ef_search"]),
+    )
+
+    return time.perf_counter() - start
+
+
+def main():
+    print("=" * 70)
+    print("STEP 04 - BUILD RETRIEVAL INDEXES")
+    print("=" * 70)
+    print(f"Embedding mode : {EMBEDDING_MODE}")
+    print(f"Embedding dim  : {MODEL_CFG['embedding_dim']}")
+
+    train_embeddings = load_embeddings("train")
+    train_metadata = load_metadata("train")
+
+    print(f"Training gallery: {len(train_embeddings):,} images")
+    print(f"Identities      : {train_metadata['identity'].nunique():,}")
+
+    fractions = RETRIEVAL_CFG.get(
+        "gallery_fractions",
+        [0.25, 0.50, 0.75, 1.00],
+    )
+
+    subsets = create_gallery_subsets(
+        train_embeddings,
+        train_metadata,
+        fractions,
+    )
+
+    mode_root = INDEX_ROOT / EMBEDDING_MODE
+    mode_root.mkdir(parents=True, exist_ok=True)
+
+    for fraction, indices in subsets.items():
+        gallery_name = f"gallery_{int(fraction * 100)}"
+        gallery_dir = mode_root / gallery_name
+        exact_dir = gallery_dir / "exact"
         lsh_dir = gallery_dir / "lsh"
-        lsh_dir.mkdir(parents=True, exist_ok=True)
-
-        print("  Building LSH...")
-
-        start = time.perf_counter()
-
-        lsh = RandomHyperplaneLSH(
-            dim=gallery_embeddings.shape[1],
-            num_bits=lsh_cfg["num_bits"],
-            num_tables=lsh_cfg["num_tables"],
-            seed=seed,
-        )
-
-        lsh.fit(gallery_embeddings)
-
-        with open(lsh_dir / "lsh_index.pkl", "wb") as f:
-            pickle.dump(lsh, f)
-
-        lsh_build_time = time.perf_counter() - start
-
-        # ----------------------------------------------------
-        # HNSW
-        # ----------------------------------------------------
-
         hnsw_dir = gallery_dir / "hnsw"
-        hnsw_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Building HNSW...")
+        for directory in [exact_dir, lsh_dir, hnsw_dir]:
+            directory.mkdir(parents=True, exist_ok=True)
 
-        start = time.perf_counter()
+        gallery = train_embeddings[indices]
+        gallery_metadata = train_metadata.iloc[indices].reset_index(drop=True)
 
-        build_hnsw_index(
-            gallery_embeddings,
-            hnsw_dir / "hnsw_index.bin",
-            space=hnsw_cfg["space"],
-            M=hnsw_cfg["M"],
-            ef_construction=hnsw_cfg["ef_construction"],
-            ef_search=hnsw_cfg["ef_search"],
+        print("\n" + "=" * 70)
+        print(f"Gallery: {fraction:.0%} ({len(gallery):,} images)")
+        print("=" * 70)
+
+        np.save(gallery_dir / "selected_indices.npy", indices)
+        np.save(exact_dir / "gallery_embeddings.npy", gallery)
+        gallery_metadata.to_csv(
+            exact_dir / "gallery_metadata.csv",
+            index=False,
         )
 
-        hnsw_build_time = time.perf_counter() - start
+        print("\nBuilding LSH...")
+        lsh_time = build_lsh(
+            gallery,
+            lsh_dir / "lsh_index.pkl",
+        )
+        print(f"  Build time: {lsh_time:.4f} s")
 
-        # ----------------------------------------------------
-        # Configuration
-        # ----------------------------------------------------
+        print("\nBuilding HNSW...")
+        hnsw_time = build_hnsw(
+            gallery,
+            hnsw_dir / "hnsw_index.bin",
+        )
+        print(f"  Build time: {hnsw_time:.4f} s")
 
         configuration = {
-            "embedding_mode": embedding_mode,
-            "embedding_dimension": model_cfg["embedding_dim"],
-            "normalize_embeddings": model_cfg.get(
-                "normalize_embeddings", True
+            "embedding_mode": EMBEDDING_MODE,
+            "embedding_dim": int(MODEL_CFG["embedding_dim"]),
+            "normalize_embeddings": bool(
+                MODEL_CFG.get("normalize_embeddings", True)
             ),
             "gallery_fraction": fraction,
-            "gallery_size": gallery_size,
-            "seed": seed,
+            "gallery_size": len(gallery),
+            "gallery_identities": int(
+                gallery_metadata["identity"].nunique()
+            ),
             "lsh": {
-                "num_bits": lsh_cfg["num_bits"],
-                "num_tables": lsh_cfg["num_tables"],
-                "build_time_s": lsh_build_time,
+                "num_bits": int(RETRIEVAL_CFG["lsh"]["num_bits"]),
+                "num_tables": int(RETRIEVAL_CFG["lsh"]["num_tables"]),
+                "build_time_s": lsh_time,
             },
             "hnsw": {
-                "space": hnsw_cfg["space"],
-                "M": hnsw_cfg["M"],
-                "ef_construction": hnsw_cfg["ef_construction"],
-                "ef_search": hnsw_cfg["ef_search"],
-                "build_time_s": hnsw_build_time,
+                "space": RETRIEVAL_CFG["hnsw"]["space"],
+                "M": int(RETRIEVAL_CFG["hnsw"]["M"]),
+                "ef_construction": int(
+                    RETRIEVAL_CFG["hnsw"]["ef_construction"]
+                ),
+                "ef_search": int(
+                    RETRIEVAL_CFG["hnsw"]["ef_search"]
+                ),
+                "build_time_s": hnsw_time,
             },
         }
 
-        with open(
-            gallery_dir / "configuration.json",
-            "w",
+        (gallery_dir / "configuration.json").write_text(
+            json.dumps(configuration, indent=2),
             encoding="utf-8",
-        ) as f:
-            json.dump(configuration, f, indent=2)
+        )
 
-        print(f"  LSH build time : {lsh_build_time:.3f}s")
-        print(f"  HNSW build time: {hnsw_build_time:.3f}s")
-
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 70)
     print("INDEX BUILD COMPLETE")
-    print("=" * 60)
-    print(f"Indexes saved to: {index_root}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nIndex building interrupted by user.")
+        sys.exit(1)
+    except Exception as e:
+        print("\n" + "=" * 70)
+        print("ERROR")
+        print("=" * 70)
+        print(e)
+        sys.exit(1)

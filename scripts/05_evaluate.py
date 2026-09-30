@@ -6,10 +6,23 @@ import sys
 import time
 from pathlib import Path
 
-import hnswlib
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import numpy as np
 import pandas as pd
 import yaml
+
+from src.evaluation.metrics import (
+    calculate_auroc,
+    calculate_baks,
+    calculate_baus,
+    calculate_geomean,
+    calculate_qps,
+)
+from src.retrieval.exact import search as exact_search
+from src.retrieval.hnsw import load_index as load_hnsw
+from src.retrieval.hnsw import search as hnsw_search
+from src.retrieval.lsh import search as lsh_search
 
 
 CONFIG_PATH = Path("configs/base.yaml")
@@ -35,45 +48,6 @@ OPEN_SET_THRESHOLD = config["open_set"].get("threshold")
 CALIBRATION_LIMIT = 1000
 
 
-class RandomHyperplaneLSH:
-    """Compatible with existing Step 04 LSH pickle files."""
-
-    def __init__(self, dim, num_bits, num_tables, seed=42):
-        self.dim, self.num_bits = dim, num_bits
-        self.num_tables, self.seed = num_tables, seed
-        self.tables, self.planes = [], []
-        rng = np.random.default_rng(seed)
-
-        for _ in range(num_tables):
-            plane = np.zeros((num_bits, dim), dtype=np.float32)
-            for bit in range(num_bits):
-                dims = rng.choice(dim, size=min(32, dim), replace=False)
-                plane[bit, dims] = rng.normal(size=len(dims)).astype(np.float32)
-            self.planes.append(plane)
-            self.tables.append({})
-
-    def _hash_vectors(self, vectors, plane):
-        bits = (vectors @ plane.T >= 0).astype(np.uint32)
-        codes = np.zeros(len(vectors), dtype=np.uint32)
-        for bit in range(self.num_bits):
-            codes |= bits[:, bit] << bit
-        return codes
-
-    def fit(self, embeddings):
-        self.tables = [{} for _ in range(self.num_tables)]
-        for table_id, plane in enumerate(self.planes):
-            codes = self._hash_vectors(embeddings, plane)
-            for index, code in enumerate(codes):
-                self.tables[table_id].setdefault(int(code), []).append(index)
-
-    def query_candidates(self, query):
-        candidates = set()
-        for table_id, plane in enumerate(self.planes):
-            code = int(self._hash_vectors(query[None], plane)[0])
-            candidates.update(self.tables[table_id].get(code, []))
-        return np.array(sorted(candidates), dtype=np.int64)
-
-
 def normalize_embeddings(embeddings):
     embeddings = np.asarray(embeddings, dtype=np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -97,51 +71,14 @@ def load_metadata(name):
 def get_directory_size_mb(path):
     if not path.exists():
         return np.nan
-    total = sum(
+    return sum(
         f.stat().st_size for f in path.rglob("*") if f.is_file()
-    )
-    return total / (1024 * 1024)
+    ) / (1024 * 1024)
 
 
-def exact_search(gallery, query, top_k):
-    similarities = gallery @ query
-    k = min(top_k, len(similarities))
-
-    if k == len(similarities):
-        indices = np.argsort(-similarities)
-    else:
-        indices = np.argpartition(-similarities, k - 1)[:k]
-        indices = indices[np.argsort(-similarities[indices])]
-
-    return indices, similarities[indices], len(gallery)
-
-
-def lsh_search(lsh, gallery, query, top_k):
-    candidates = lsh.query_candidates(query)
-
-    if len(candidates) == 0:
-        return np.array([], dtype=int), np.array([], dtype=np.float32), 0
-
-    candidates = candidates[
-        (candidates >= 0) & (candidates < len(gallery))
-    ]
-
-    if len(candidates) == 0:
-        return np.array([], dtype=int), np.array([], dtype=np.float32), 0
-
-    similarities = gallery[candidates] @ query
-    k = min(top_k, len(candidates))
-    order = np.argsort(-similarities)[:k]
-
-    return candidates[order], similarities[order], len(candidates)
-
-
-def hnsw_search(index, query, top_k):
-    k = min(top_k, index.get_current_count())
-    labels, distances = index.knn_query(query.reshape(1, -1), k=k)
-    indices = labels[0].astype(int)
-    similarities = 1.0 - distances[0]
-    return indices, similarities, np.nan
+def load_lsh(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def search(method, query, top_k, gallery, lsh=None, hnsw=None):
@@ -159,7 +96,6 @@ def calibrate_threshold(
 ):
     gallery_ids = gallery_metadata["identity"].to_numpy()
     counts = pd.Series(gallery_ids).value_counts()
-
     valid_indices = [
         i for i, identity in enumerate(gallery_ids) if counts[identity] >= 2
     ]
@@ -185,13 +121,10 @@ def calibrate_threshold(
         keep = indices != gallery_index
         indices, similarities = indices[keep], similarities[keep]
 
-        if len(indices) == 0:
-            continue
-
-        best = int(np.argmax(similarities))
-
-        if gallery_ids[indices[best]] == true_identity:
-            known_scores.append(float(similarities[best]))
+        if len(indices):
+            best = int(np.argmax(similarities))
+            if gallery_ids[indices[best]] == true_identity:
+                known_scores.append(float(similarities[best]))
 
     unknown_limit = min(CALIBRATION_LIMIT, len(validation_embeddings))
     validation_indices = rng.choice(
@@ -234,7 +167,8 @@ def calibrate_threshold(
         geomean = np.sqrt(known_acceptance * unknown_rejection)
 
         if geomean > best_geomean:
-            best_threshold, best_geomean = float(threshold), geomean
+            best_threshold = float(threshold)
+            best_geomean = geomean
 
     calibration = {
         "threshold": best_threshold,
@@ -249,44 +183,8 @@ def calibrate_threshold(
 
     print(f"  Threshold: {best_threshold:.6f}")
     print(f"  Calibration GeoMean: {best_geomean:.4f}")
+
     return calibration
-
-
-def calculate_auroc(known_scores, unknown_scores):
-    known_scores = np.asarray(known_scores, dtype=np.float64)
-    unknown_scores = np.asarray(unknown_scores, dtype=np.float64)
-
-    if not len(known_scores) or not len(unknown_scores):
-        return np.nan
-
-    scores = np.concatenate([known_scores, unknown_scores])
-    labels = np.concatenate([
-        np.ones(len(known_scores)),
-        np.zeros(len(unknown_scores)),
-    ])
-
-    order = np.argsort(scores)
-    sorted_scores = scores[order]
-    sorted_labels = labels[order]
-    ranks = np.empty(len(sorted_scores), dtype=float)
-
-    i = 0
-    while i < len(sorted_scores):
-        j = i + 1
-        while j < len(sorted_scores) and sorted_scores[j] == sorted_scores[i]:
-            j += 1
-        ranks[i:j] = (i + j + 1) / 2.0
-        i = j
-
-    positive_ranks = ranks[sorted_labels == 1]
-    n_positive, n_negative = len(known_scores), len(unknown_scores)
-
-    return float(
-        (
-            positive_ranks.sum()
-            - n_positive * (n_positive + 1) / 2
-        ) / (n_positive * n_negative)
-    )
 
 
 def evaluate_method(
@@ -304,11 +202,8 @@ def evaluate_method(
     gallery_identity_set = set(gallery_ids)
 
     top1_correct = top5_correct = recall_hits = 0
-    known_count = unknown_count = 0
-    known_accepted_correct = unknown_rejected = 0
-
-    known_scores, unknown_scores = [], []
-    latencies, comparisons = [], []
+    known_count = unknown_count = known_accepted_correct = unknown_rejected = 0
+    known_scores, unknown_scores, latencies, comparisons = [], [], [], []
 
     for query_index, query in enumerate(test_embeddings):
         true_identity = test_ids[query_index]
@@ -358,23 +253,13 @@ def evaluate_method(
     top5 = top5_correct / known_count if known_count else np.nan
     recall_at_k = recall_hits / known_count if known_count else np.nan
 
-    baks = (
-        known_accepted_correct / known_count
-        if known_count else np.nan
-    )
-    baus = (
-        unknown_rejected / unknown_count
-        if unknown_count else np.nan
-    )
-    geomean = (
-        np.sqrt(baks * baus)
-        if not np.isnan(baks) and not np.isnan(baus)
-        else np.nan
-    )
+    baks = calculate_baks(known_accepted_correct, known_count)
+    baus = calculate_baus(unknown_rejected, unknown_count)
+    geomean = calculate_geomean(baks, baus)
 
     avg_latency = float(np.mean(latencies)) if latencies else np.nan
     p95_latency = float(np.percentile(latencies, 95)) if latencies else np.nan
-    qps = 1000.0 / avg_latency if avg_latency > 0 else np.nan
+    qps = calculate_qps(avg_latency)
     avg_comparisons = float(np.mean(comparisons)) if comparisons else np.nan
 
     return {
@@ -392,17 +277,6 @@ def evaluate_method(
         "known_queries": known_count,
         "unknown_queries": unknown_count,
     }
-
-
-def load_lsh(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def load_hnsw(path, dimension, space):
-    index = hnswlib.Index(space=space, dim=dimension)
-    index.load_index(str(path))
-    return index
 
 
 def main():
@@ -454,10 +328,9 @@ def main():
         gallery_metadata = pd.read_csv(
             exact_dir / "gallery_metadata.csv"
         )
-
         gallery_size = len(gallery)
-        print(f"Gallery size : {gallery_size:,}")
 
+        print(f"Gallery size : {gallery_size:,}")
         print("Loading LSH...")
         lsh = load_lsh(lsh_dir / "lsh_index.pkl")
 
@@ -469,9 +342,11 @@ def main():
             hnsw_cfg["space"],
         )
 
-        exact_size_mb = get_directory_size_mb(exact_dir)
-        lsh_size_mb = get_directory_size_mb(lsh_dir)
-        hnsw_size_mb = get_directory_size_mb(hnsw_dir)
+        sizes = {
+            "Exact": get_directory_size_mb(exact_dir),
+            "LSH": get_directory_size_mb(lsh_dir),
+            "HNSW": get_directory_size_mb(hnsw_dir),
+        }
 
         configuration_path = gallery_dir / "configuration.json"
 
@@ -479,18 +354,21 @@ def main():
             configuration = json.loads(
                 configuration_path.read_text(encoding="utf-8")
             )
-            lsh_build_time = float(configuration["lsh"]["build_time_s"])
-            hnsw_build_time = float(configuration["hnsw"]["build_time_s"])
+            build_times = {
+                "Exact": 0.0,
+                "LSH": float(configuration["lsh"]["build_time_s"]),
+                "HNSW": float(configuration["hnsw"]["build_time_s"]),
+            }
         else:
-            lsh_build_time = hnsw_build_time = np.nan
+            build_times = {"Exact": 0.0, "LSH": np.nan, "HNSW": np.nan}
 
         methods = [
-            ("Exact", None, None, 0.0, exact_size_mb),
-            ("LSH", lsh, None, lsh_build_time, lsh_size_mb),
-            ("HNSW", None, hnsw, hnsw_build_time, hnsw_size_mb),
+            ("Exact", None, None),
+            ("LSH", lsh, None),
+            ("HNSW", None, hnsw),
         ]
 
-        for method, lsh_object, hnsw_object, build_time, index_size_mb in methods:
+        for method, lsh_object, hnsw_object in methods:
             print(f"\nEvaluating {method}...")
 
             if OPEN_SET_THRESHOLD is not None:
@@ -525,20 +403,19 @@ def main():
                 hnsw=hnsw_object,
             )
 
-            result = {
+            all_results.append({
                 "gallery_fraction": fraction,
                 "gallery_size": gallery_size,
                 "method": method,
                 "top_k": TOP_K,
                 "threshold": threshold,
                 **metrics,
-                "index_build_time_s": build_time,
-                "index_size_mb": index_size_mb,
+                "index_build_time_s": build_times[method],
+                "index_size_mb": sizes[method],
                 "calibration_known": calibration["known_count"],
                 "calibration_unknown": calibration["unknown_count"],
                 "calibration_geomean": calibration["calibration_geomean"],
-            }
-            all_results.append(result)
+            })
 
             print(f"  Threshold : {threshold:.6f}")
             print(f"  Top-1     : {metrics['top1']:.4f}")
@@ -552,8 +429,8 @@ def main():
             print(f"  P95 latency: {metrics['p95_latency_ms']:.4f} ms")
             print(f"  QPS       : {metrics['qps']:.2f}")
             print(f"  Comparisons: {metrics['comparisons']}")
-            print(f"  Index size: {index_size_mb:.2f} MB")
-            print(f"  Build time: {build_time:.4f} s")
+            print(f"  Index size: {sizes[method]:.2f} MB")
+            print(f"  Build time: {build_times[method]:.4f} s")
 
     results_df = pd.DataFrame(all_results)
 
@@ -566,10 +443,6 @@ def main():
         encoding="utf-8",
     )
 
-    print("\n" + "=" * 70)
-    print("EVALUATION COMPLETE")
-    print("=" * 70)
-
     columns = [
         "gallery_fraction", "gallery_size", "method", "threshold",
         "top1", "top5", "baks", "baus", "geomean", "auroc",
@@ -577,6 +450,9 @@ def main():
         "comparisons", "index_build_time_s", "index_size_mb",
     ]
 
+    print("\n" + "=" * 70)
+    print("EVALUATION COMPLETE")
+    print("=" * 70)
     print(results_df[columns].to_string(index=False))
     print(f"\nCSV saved to: {results_path}")
     print(f"JSON saved to: {json_path}")
