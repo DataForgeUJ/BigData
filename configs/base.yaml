@@ -6,12 +6,14 @@ data:
   processed_dir: data/processed
   splits_dir: data/splits
   embeddings_dir: data/embeddings
+  embedding_mode: finetuned
   image_size: 224
 
 model:
   backbone: resnet50
   pretrained: imagenet
   # ResNet-50 backbone output dimension
+  checkpoint: artifacts/checkpoints/best_resnet50.pth
   embedding_dim: 2048
   normalize_embeddings: true
 
