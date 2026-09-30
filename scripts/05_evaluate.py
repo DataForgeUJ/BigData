@@ -1,4 +1,4 @@
-"""Evaluate Exact, LSH, and HNSW retrieval with open-set recognition."""
+"""Evaluate Exact, LSH, and HNSW retrieval performance."""
 
 import json
 import pickle
@@ -6,356 +6,392 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 import hnswlib
 import numpy as np
 import pandas as pd
 import yaml
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
 CONFIG_PATH = Path("configs/base.yaml")
 INDEX_ROOT = Path("artifacts/indexes")
 RESULT_ROOT = Path("artifacts/results")
 
+config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+SEED = config.get("seed", 42)
+DATA_CFG = config["data"]
+MODEL_CFG = config["model"]
+RETRIEVAL_CFG = config["retrieval"]
 
-# ============================================================
-# Configuration / Data
-# ============================================================
+EMBEDDING_MODE = DATA_CFG.get("embedding_mode", "finetuned")
+EMBEDDING_ROOT = Path(DATA_CFG["embeddings_dir"]) / EMBEDDING_MODE
+RESULT_DIR = RESULT_ROOT / EMBEDDING_MODE
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+TOP_K = int(RETRIEVAL_CFG.get("top_k", 5))
+GALLERY_FRACTIONS = RETRIEVAL_CFG.get(
+    "gallery_fractions", [0.25, 0.50, 0.75, 1.00]
+)
+OPEN_SET_THRESHOLD = config["open_set"].get("threshold")
+CALIBRATION_LIMIT = 1000
 
-
-def load_embeddings(embedding_dir, filename):
-    return np.load(embedding_dir / filename).astype(np.float32)
-
-
-def load_metadata(embedding_dir, filename):
-    return pd.read_csv(embedding_dir / filename)
-
-
-def normalize_embeddings(embeddings):
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    return embeddings / np.maximum(norms, 1e-12)
-
-
-# ============================================================
-# LSH
-# ============================================================
 
 class RandomHyperplaneLSH:
-    def __init__(self, dim, num_bits, num_tables, seed=42):
-        self.dim = dim
-        self.num_bits = num_bits
-        self.num_tables = num_tables
-        self.seed = seed
-        self.tables = []
-        self.planes = []
+    """Compatible with existing Step 04 LSH pickle files."""
 
+    def __init__(self, dim, num_bits, num_tables, seed=42):
+        self.dim, self.num_bits = dim, num_bits
+        self.num_tables, self.seed = num_tables, seed
+        self.tables, self.planes = [], []
         rng = np.random.default_rng(seed)
 
         for _ in range(num_tables):
             plane = np.zeros((num_bits, dim), dtype=np.float32)
-
             for bit in range(num_bits):
-                dims = rng.choice(
-                    dim,
-                    size=min(32, dim),
-                    replace=False,
-                )
-                values = rng.normal(size=len(dims)).astype(np.float32)
-                plane[bit, dims] = values
-
+                dims = rng.choice(dim, size=min(32, dim), replace=False)
+                plane[bit, dims] = rng.normal(size=len(dims)).astype(np.float32)
             self.planes.append(plane)
             self.tables.append({})
 
     def _hash_vectors(self, vectors, plane):
-        projections = vectors @ plane.T
-        bits = (projections >= 0).astype(np.uint32)
-
+        bits = (vectors @ plane.T >= 0).astype(np.uint32)
         codes = np.zeros(len(vectors), dtype=np.uint32)
-
         for bit in range(self.num_bits):
             codes |= bits[:, bit] << bit
-
         return codes
+
+    def fit(self, embeddings):
+        self.tables = [{} for _ in range(self.num_tables)]
+        for table_id, plane in enumerate(self.planes):
+            codes = self._hash_vectors(embeddings, plane)
+            for index, code in enumerate(codes):
+                self.tables[table_id].setdefault(int(code), []).append(index)
 
     def query_candidates(self, query):
         candidates = set()
-
         for table_id, plane in enumerate(self.planes):
-            code = int(
-                self._hash_vectors(
-                    query[None],
-                    plane,
-                )[0]
-            )
-            candidates.update(
-                self.tables[table_id].get(code, [])
-            )
-
-        return np.array(
-            sorted(candidates),
-            dtype=np.int64,
-        )
+            code = int(self._hash_vectors(query[None], plane)[0])
+            candidates.update(self.tables[table_id].get(code, []))
+        return np.array(sorted(candidates), dtype=np.int64)
 
 
-# ============================================================
-# Search
-# ============================================================
-
-def exact_search(
-    query,
-    gallery_embeddings,
-    top_k,
-    exclude_index=None,
-):
-    scores = gallery_embeddings @ query
-
-    if exclude_index is not None:
-        scores[exclude_index] = -np.inf
-
-    k = min(top_k, len(scores))
-    indices = np.argpartition(-scores, k - 1)[:k]
-    indices = indices[np.argsort(-scores[indices])]
-
-    return indices, scores[indices]
+def normalize_embeddings(embeddings):
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return embeddings / np.maximum(norms, 1e-12)
 
 
-def lsh_search(
-    query,
-    gallery_embeddings,
-    lsh,
-    top_k,
-    exclude_index=None,
-):
+def load_embeddings(name):
+    path = EMBEDDING_ROOT / f"{name}_embeddings.npy"
+    if not path.exists():
+        raise FileNotFoundError(f"Embedding file not found: {path}")
+    return normalize_embeddings(np.load(path))
+
+
+def load_metadata(name):
+    path = EMBEDDING_ROOT / f"{name}_metadata.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Metadata file not found: {path}")
+    return pd.read_csv(path)
+
+
+def get_directory_size_mb(path):
+    if not path.exists():
+        return np.nan
+    total = sum(
+        f.stat().st_size for f in path.rglob("*") if f.is_file()
+    )
+    return total / (1024 * 1024)
+
+
+def exact_search(gallery, query, top_k):
+    similarities = gallery @ query
+    k = min(top_k, len(similarities))
+
+    if k == len(similarities):
+        indices = np.argsort(-similarities)
+    else:
+        indices = np.argpartition(-similarities, k - 1)[:k]
+        indices = indices[np.argsort(-similarities[indices])]
+
+    return indices, similarities[indices], len(gallery)
+
+
+def lsh_search(lsh, gallery, query, top_k):
     candidates = lsh.query_candidates(query)
 
-    if exclude_index is not None:
-        candidates = candidates[candidates != exclude_index]
+    if len(candidates) == 0:
+        return np.array([], dtype=int), np.array([], dtype=np.float32), 0
+
+    candidates = candidates[
+        (candidates >= 0) & (candidates < len(gallery))
+    ]
 
     if len(candidates) == 0:
-        return np.array([], dtype=np.int64), np.array([])
+        return np.array([], dtype=int), np.array([], dtype=np.float32), 0
 
-    scores = gallery_embeddings[candidates] @ query
-
+    similarities = gallery[candidates] @ query
     k = min(top_k, len(candidates))
-    order = np.argsort(-scores)[:k]
+    order = np.argsort(-similarities)[:k]
 
-    return candidates[order], scores[order]
-
-
-def hnsw_search(
-    query,
-    index,
-    top_k,
-    exclude_index=None,
-):
-    k = min(
-        top_k + (1 if exclude_index is not None else 0),
-        index.get_current_count(),
-    )
-
-    labels, distances = index.knn_query(
-        query[None],
-        k=k,
-    )
-
-    labels = labels[0]
-    distances = distances[0]
-
-    if exclude_index is not None:
-        keep = labels != exclude_index
-        labels = labels[keep]
-        distances = distances[keep]
-
-    scores = 1.0 - distances
-
-    return labels[:top_k], scores[:top_k]
+    return candidates[order], similarities[order], len(candidates)
 
 
-def search_one(
-    method,
-    query,
-    gallery_embeddings,
-    top_k,
-    lsh=None,
-    hnsw=None,
-    exclude_index=None,
-):
+def hnsw_search(index, query, top_k):
+    k = min(top_k, index.get_current_count())
+    labels, distances = index.knn_query(query.reshape(1, -1), k=k)
+    indices = labels[0].astype(int)
+    similarities = 1.0 - distances[0]
+    return indices, similarities, np.nan
+
+
+def search(method, query, top_k, gallery, lsh=None, hnsw=None):
     if method == "Exact":
-        return exact_search(
-            query,
-            gallery_embeddings,
-            top_k,
-            exclude_index,
-        )
-
+        return exact_search(gallery, query, top_k)
     if method == "LSH":
-        return lsh_search(
-            query,
-            gallery_embeddings,
-            lsh,
-            top_k,
-            exclude_index,
-        )
-
+        return lsh_search(lsh, gallery, query, top_k)
     if method == "HNSW":
-        return hnsw_search(
-            query,
-            hnsw,
-            top_k,
-            exclude_index,
-        )
-
+        return hnsw_search(hnsw, query, top_k)
     raise ValueError(f"Unknown method: {method}")
 
 
-# ============================================================
-# Open-Set Calibration
-# ============================================================
-
 def calibrate_threshold(
+    method, gallery, gallery_metadata, validation_embeddings, lsh=None, hnsw=None
+):
+    gallery_ids = gallery_metadata["identity"].to_numpy()
+    counts = pd.Series(gallery_ids).value_counts()
+
+    valid_indices = [
+        i for i, identity in enumerate(gallery_ids) if counts[identity] >= 2
+    ]
+
+    rng = np.random.default_rng(SEED)
+
+    if len(valid_indices) > CALIBRATION_LIMIT:
+        valid_indices = rng.choice(
+            valid_indices, size=CALIBRATION_LIMIT, replace=False
+        )
+
+    print(f"  Known calibration candidates : {len(valid_indices)}")
+    known_scores = []
+
+    for gallery_index in valid_indices:
+        query = gallery[gallery_index]
+        true_identity = gallery_ids[gallery_index]
+
+        indices, similarities, _ = search(
+            method, query, TOP_K + 1, gallery, lsh=lsh, hnsw=hnsw
+        )
+
+        keep = indices != gallery_index
+        indices, similarities = indices[keep], similarities[keep]
+
+        if len(indices) == 0:
+            continue
+
+        best = int(np.argmax(similarities))
+
+        if gallery_ids[indices[best]] == true_identity:
+            known_scores.append(float(similarities[best]))
+
+    unknown_limit = min(CALIBRATION_LIMIT, len(validation_embeddings))
+    validation_indices = rng.choice(
+        len(validation_embeddings),
+        size=unknown_limit,
+        replace=False,
+    )
+
+    print(f"  Unknown calibration candidates: {len(validation_indices)}")
+    unknown_scores = []
+
+    for validation_index in validation_indices:
+        _, similarities, _ = search(
+            method,
+            validation_embeddings[validation_index],
+            1,
+            gallery,
+            lsh=lsh,
+            hnsw=hnsw,
+        )
+        if len(similarities):
+            unknown_scores.append(float(similarities[0]))
+
+    if not known_scores:
+        raise RuntimeError(f"{method}: no known calibration scores were produced.")
+    if not unknown_scores:
+        raise RuntimeError(f"{method}: no unknown calibration scores were produced.")
+
+    known_scores = np.asarray(known_scores, dtype=np.float32)
+    unknown_scores = np.asarray(unknown_scores, dtype=np.float32)
+
+    scores = np.concatenate([known_scores, unknown_scores])
+    thresholds = np.unique(np.quantile(scores, np.linspace(0, 1, 201)))
+
+    best_threshold, best_geomean = None, -1.0
+
+    for threshold in thresholds:
+        known_acceptance = np.mean(known_scores >= threshold)
+        unknown_rejection = np.mean(unknown_scores < threshold)
+        geomean = np.sqrt(known_acceptance * unknown_rejection)
+
+        if geomean > best_geomean:
+            best_threshold, best_geomean = float(threshold), geomean
+
+    calibration = {
+        "threshold": best_threshold,
+        "known_count": len(known_scores),
+        "unknown_count": len(unknown_scores),
+        "known_mean": float(np.mean(known_scores)),
+        "known_median": float(np.median(known_scores)),
+        "unknown_mean": float(np.mean(unknown_scores)),
+        "unknown_median": float(np.median(unknown_scores)),
+        "calibration_geomean": float(best_geomean),
+    }
+
+    print(f"  Threshold: {best_threshold:.6f}")
+    print(f"  Calibration GeoMean: {best_geomean:.4f}")
+    return calibration
+
+
+def calculate_auroc(known_scores, unknown_scores):
+    known_scores = np.asarray(known_scores, dtype=np.float64)
+    unknown_scores = np.asarray(unknown_scores, dtype=np.float64)
+
+    if not len(known_scores) or not len(unknown_scores):
+        return np.nan
+
+    scores = np.concatenate([known_scores, unknown_scores])
+    labels = np.concatenate([
+        np.ones(len(known_scores)),
+        np.zeros(len(unknown_scores)),
+    ])
+
+    order = np.argsort(scores)
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    ranks = np.empty(len(sorted_scores), dtype=float)
+
+    i = 0
+    while i < len(sorted_scores):
+        j = i + 1
+        while j < len(sorted_scores) and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        ranks[i:j] = (i + j + 1) / 2.0
+        i = j
+
+    positive_ranks = ranks[sorted_labels == 1]
+    n_positive, n_negative = len(known_scores), len(unknown_scores)
+
+    return float(
+        (
+            positive_ranks.sum()
+            - n_positive * (n_positive + 1) / 2
+        ) / (n_positive * n_negative)
+    )
+
+
+def evaluate_method(
     method,
-    known_queries,
-    unknown_queries,
-    gallery_embeddings,
-    top_k,
+    gallery,
+    gallery_metadata,
+    test_embeddings,
+    test_metadata,
+    threshold,
     lsh=None,
     hnsw=None,
 ):
-    scores = []
+    gallery_ids = gallery_metadata["identity"].to_numpy()
+    test_ids = test_metadata["identity"].to_numpy()
+    gallery_identity_set = set(gallery_ids)
 
-    # Known queries
-    for i, query in enumerate(known_queries):
-        _, result_scores = search_one(
-            method,
-            query,
-            gallery_embeddings,
-            top_k=1,
-            lsh=lsh,
-            hnsw=hnsw,
-            exclude_index=i,
+    top1_correct = top5_correct = recall_hits = 0
+    known_count = unknown_count = 0
+    known_accepted_correct = unknown_rejected = 0
+
+    known_scores, unknown_scores = [], []
+    latencies, comparisons = [], []
+
+    for query_index, query in enumerate(test_embeddings):
+        true_identity = test_ids[query_index]
+        is_known = true_identity in gallery_identity_set
+
+        if is_known:
+            known_count += 1
+        else:
+            unknown_count += 1
+
+        start = time.perf_counter()
+        indices, similarities, comparison_count = search(
+            method, query, TOP_K, gallery, lsh=lsh, hnsw=hnsw
         )
+        latencies.append((time.perf_counter() - start) * 1000.0)
 
-        if len(result_scores):
-            scores.append(
-                (float(result_scores[0]), 1)
-            )
+        if not np.isnan(comparison_count):
+            comparisons.append(comparison_count)
 
-    # Unknown queries
-    for query in unknown_queries:
-        _, result_scores = search_one(
-            method,
-            query,
-            gallery_embeddings,
-            top_k=1,
-            lsh=lsh,
-            hnsw=hnsw,
-        )
+        if len(indices) == 0:
+            if not is_known:
+                unknown_scores.append(-1.0)
+            continue
 
-        if len(result_scores):
-            scores.append(
-                (float(result_scores[0]), 0)
-            )
+        predicted_ids = [gallery_ids[i] for i in indices]
+        best_similarity = float(similarities[0])
 
-    if not scores:
-        return 0.0
+        if is_known:
+            if predicted_ids[0] == true_identity:
+                top1_correct += 1
+            if true_identity in predicted_ids:
+                top5_correct += 1
+                recall_hits += 1
 
-    values = np.array(
-        [x[0] for x in scores],
-        dtype=float,
+        accepted = best_similarity >= threshold
+
+        if is_known:
+            if accepted and predicted_ids[0] == true_identity:
+                known_accepted_correct += 1
+            known_scores.append(best_similarity)
+        else:
+            if not accepted:
+                unknown_rejected += 1
+            unknown_scores.append(best_similarity)
+
+    top1 = top1_correct / known_count if known_count else np.nan
+    top5 = top5_correct / known_count if known_count else np.nan
+    recall_at_k = recall_hits / known_count if known_count else np.nan
+
+    baks = (
+        known_accepted_correct / known_count
+        if known_count else np.nan
     )
-    labels = np.array(
-        [x[1] for x in scores],
-        dtype=int,
+    baus = (
+        unknown_rejected / unknown_count
+        if unknown_count else np.nan
+    )
+    geomean = (
+        np.sqrt(baks * baus)
+        if not np.isnan(baks) and not np.isnan(baus)
+        else np.nan
     )
 
-    thresholds = np.unique(values)
+    avg_latency = float(np.mean(latencies)) if latencies else np.nan
+    p95_latency = float(np.percentile(latencies, 95)) if latencies else np.nan
+    qps = 1000.0 / avg_latency if avg_latency > 0 else np.nan
+    avg_comparisons = float(np.mean(comparisons)) if comparisons else np.nan
 
-    best_threshold = thresholds[0]
-    best_j = -np.inf
-
-    for threshold in thresholds:
-        predicted = values >= threshold
-
-        tp = np.sum((predicted == 1) & (labels == 1))
-        fn = np.sum((predicted == 0) & (labels == 1))
-        fp = np.sum((predicted == 1) & (labels == 0))
-        tn = np.sum((predicted == 0) & (labels == 0))
-
-        tpr = tp / max(tp + fn, 1)
-        fpr = fp / max(fp + tn, 1)
-
-        j = tpr - fpr
-
-        if j > best_j:
-            best_j = j
-            best_threshold = threshold
-
-    return float(best_threshold)
-
-
-# ============================================================
-# Metrics
-# ============================================================
-
-def calculate_metrics(
-    predictions,
-    true_identities,
-    known_flags,
-):
-    predictions = np.asarray(predictions)
-    true_identities = np.asarray(true_identities)
-    known_flags = np.asarray(known_flags)
-
-    known_mask = known_flags == 1
-    unknown_mask = known_flags == 0
-
-    # BAKS: correct identification among known queries
-    if known_mask.any():
-        baks = np.mean(
-            predictions[known_mask]
-            == true_identities[known_mask]
-        )
-    else:
-        baks = np.nan
-
-    # BAUS: correctly rejected unknown queries
-    if unknown_mask.any():
-        baus = np.mean(
-            predictions[unknown_mask] == -1
-        )
-    else:
-        baus = np.nan
-
-    if np.isfinite(baks) and np.isfinite(baus):
-        geomean = np.sqrt(baks * baus)
-    else:
-        geomean = np.nan
-
-    return baks, baus, geomean
-
-
-# ============================================================
-# Utilities
-# ============================================================
-
-def get_directory_size_mb(path):
-    total = 0
-
-    if path.exists():
-        for file in path.rglob("*"):
-            if file.is_file():
-                total += file.stat().st_size
-
-    return total / (1024 ** 2)
+    return {
+        "top1": top1,
+        "top5": top5,
+        "baks": baks,
+        "baus": baus,
+        "geomean": geomean,
+        "auroc": calculate_auroc(known_scores, unknown_scores),
+        "recall_at_k": recall_at_k,
+        "avg_latency_ms": avg_latency,
+        "p95_latency_ms": p95_latency,
+        "qps": qps,
+        "comparisons": avg_comparisons,
+        "known_queries": known_count,
+        "unknown_queries": unknown_count,
+    }
 
 
 def load_lsh(path):
@@ -363,453 +399,198 @@ def load_lsh(path):
         return pickle.load(f)
 
 
-def load_hnsw(path, dim, space):
-    index = hnswlib.Index(
-        space=space,
-        dim=dim,
-    )
+def load_hnsw(path, dimension, space):
+    index = hnswlib.Index(space=space, dim=dimension)
     index.load_index(str(path))
     return index
 
 
-# ============================================================
-# Main Evaluation
-# ============================================================
-
 def main():
-    config = load_config()
+    print("=" * 70)
+    print("STEP 05 - RETRIEVAL EVALUATION")
+    print("=" * 70)
+    print(f"Embedding mode : {EMBEDDING_MODE}")
+    print(f"Top-k          : {TOP_K}")
+    print(f"Gallery sizes  : {GALLERY_FRACTIONS}\n")
 
-    seed = config["seed"]
-    data_cfg = config["data"]
-    model_cfg = config["model"]
-    retrieval_cfg = config["retrieval"]
-    open_set_cfg = config["open_set"]
-    evaluation_cfg = config["evaluation"]
+    print("Loading embeddings...")
+    train_embeddings = load_embeddings("train")
+    validation_embeddings = load_embeddings("validation")
+    test_embeddings = load_embeddings("test")
 
-    embedding_mode = data_cfg.get(
-        "embedding_mode",
-        "finetuned",
+    train_metadata = load_metadata("train")
+    validation_metadata = load_metadata("validation")
+    test_metadata = load_metadata("test")
+
+    print(
+        f"Train      : {len(train_embeddings):,} images / "
+        f"{train_metadata['identity'].nunique():,} identities"
+    )
+    print(
+        f"Validation : {len(validation_embeddings):,} images / "
+        f"{validation_metadata['identity'].nunique():,} identities"
+    )
+    print(
+        f"Test       : {len(test_embeddings):,} images / "
+        f"{test_metadata['identity'].nunique():,} identities\n"
     )
 
-    embedding_dir = (
-        Path(data_cfg["embeddings_dir"])
-        / embedding_mode
-    )
+    all_results = []
 
-    index_root = INDEX_ROOT / embedding_mode
-    result_root = RESULT_ROOT / embedding_mode
-    result_root.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    top_k = retrieval_cfg["top_k"]
-    gallery_fractions = retrieval_cfg["gallery_fractions"]
-
-    lsh_cfg = retrieval_cfg["lsh"]
-    hnsw_cfg = retrieval_cfg["hnsw"]
-
-    # --------------------------------------------------------
-    # Load query data
-    # --------------------------------------------------------
-
-    train_embeddings = load_embeddings(
-        embedding_dir,
-        "train_embeddings.npy",
-    )
-
-    train_metadata = load_metadata(
-        embedding_dir,
-        "train_metadata.csv",
-    )
-
-    validation_embeddings = load_embeddings(
-        embedding_dir,
-        "validation_embeddings.npy",
-    )
-
-    validation_metadata = load_metadata(
-        embedding_dir,
-        "validation_metadata.csv",
-    )
-
-    if model_cfg.get("normalize_embeddings", True):
-        train_embeddings = normalize_embeddings(
-            train_embeddings
-        )
-        validation_embeddings = normalize_embeddings(
-            validation_embeddings
-        )
-
-    print("=" * 60)
-    print("STEP 05: RETRIEVAL EVALUATION")
-    print("=" * 60)
-    print(f"Embedding mode : {embedding_mode}")
-    print(f"Embedding dim  : {model_cfg['embedding_dim']}")
-    print(f"Top-k          : {top_k}")
-    print(f"Seed           : {seed}")
-    print()
-
-    # --------------------------------------------------------
-    # Results
-    # --------------------------------------------------------
-
-    results = []
-
-    methods = [
-        "Exact",
-        "LSH",
-        "HNSW",
-    ]
-
-    # --------------------------------------------------------
-    # Gallery evaluation
-    # --------------------------------------------------------
-
-    for fraction in gallery_fractions:
+    for fraction in GALLERY_FRACTIONS:
         gallery_name = f"gallery_{int(fraction * 100)}"
-        gallery_dir = index_root / gallery_name
-
-        print("-" * 60)
-        print(f"Gallery: {fraction:.0%}")
-
+        gallery_dir = INDEX_ROOT / EMBEDDING_MODE / gallery_name
         exact_dir = gallery_dir / "exact"
         lsh_dir = gallery_dir / "lsh"
         hnsw_dir = gallery_dir / "hnsw"
 
-        gallery_embeddings = np.load(
-            exact_dir / "gallery_embeddings.npy"
-        ).astype(np.float32)
+        print("=" * 70)
+        print(f"Gallery: {fraction:.0%}")
+        print("=" * 70)
 
+        gallery = normalize_embeddings(
+            np.load(exact_dir / "gallery_embeddings.npy")
+        )
         gallery_metadata = pd.read_csv(
             exact_dir / "gallery_metadata.csv"
         )
 
-        # ----------------------------------------------------
-        # Load indexes
-        # ----------------------------------------------------
+        gallery_size = len(gallery)
+        print(f"Gallery size : {gallery_size:,}")
 
-        lsh = load_lsh(
-            lsh_dir / "lsh_index.pkl"
-        )
+        print("Loading LSH...")
+        lsh = load_lsh(lsh_dir / "lsh_index.pkl")
 
+        print("Loading HNSW...")
+        hnsw_cfg = RETRIEVAL_CFG["hnsw"]
         hnsw = load_hnsw(
             hnsw_dir / "hnsw_index.bin",
-            dim=model_cfg["embedding_dim"],
-            space=hnsw_cfg["space"],
+            int(MODEL_CFG["embedding_dim"]),
+            hnsw_cfg["space"],
         )
 
-        # ----------------------------------------------------
-        # Calibration
-        # ----------------------------------------------------
+        exact_size_mb = get_directory_size_mb(exact_dir)
+        lsh_size_mb = get_directory_size_mb(lsh_dir)
+        hnsw_size_mb = get_directory_size_mb(hnsw_dir)
 
-        calibration_size = min(
-            1000,
-            len(train_embeddings),
-            len(validation_embeddings),
-        )
+        configuration_path = gallery_dir / "configuration.json"
 
-        known_queries = train_embeddings[
-            :calibration_size
+        if configuration_path.exists():
+            configuration = json.loads(
+                configuration_path.read_text(encoding="utf-8")
+            )
+            lsh_build_time = float(configuration["lsh"]["build_time_s"])
+            hnsw_build_time = float(configuration["hnsw"]["build_time_s"])
+        else:
+            lsh_build_time = hnsw_build_time = np.nan
+
+        methods = [
+            ("Exact", None, None, 0.0, exact_size_mb),
+            ("LSH", lsh, None, lsh_build_time, lsh_size_mb),
+            ("HNSW", None, hnsw, hnsw_build_time, hnsw_size_mb),
         ]
 
-        unknown_queries = validation_embeddings[
-            :calibration_size
-        ]
+        for method, lsh_object, hnsw_object, build_time, index_size_mb in methods:
+            print(f"\nEvaluating {method}...")
 
-        # For 100% gallery, leave-one-out is possible.
-        # For smaller galleries, only use known queries whose
-        # identities occur in the gallery.
-
-        gallery_ids = set(
-            gallery_metadata["identity"]
-        )
-
-        known_indices = [
-            i
-            for i, identity in enumerate(
-                train_metadata["identity"]
-            )
-            if identity in gallery_ids
-        ]
-
-        known_indices = known_indices[
-            :calibration_size
-        ]
-
-        known_queries = train_embeddings[
-            known_indices
-        ]
-
-        # ----------------------------------------------------
-        # Evaluate each method
-        # ----------------------------------------------------
-
-        for method in methods:
-            print(f"  Evaluating {method}...")
-
-            # Threshold
-            if open_set_cfg["threshold"] is not None:
-                threshold = float(
-                    open_set_cfg["threshold"]
-                )
-            else:
-                threshold = calibrate_threshold(
-                    method,
-                    known_queries,
-                    unknown_queries,
-                    gallery_embeddings,
-                    top_k=1,
-                    lsh=lsh,
-                    hnsw=hnsw,
-                )
-
-            # ------------------------------------------------
-            # Test queries
-            # ------------------------------------------------
-
-            test_limit = min(
-                2000,
-                len(validation_embeddings),
-            )
-
-            query_embeddings = validation_embeddings[
-                :test_limit
-            ]
-
-            query_metadata = validation_metadata.iloc[
-                :test_limit
-            ].reset_index(drop=True)
-
-            predictions = []
-            true_ids = []
-            known_flags = []
-            latencies = []
-            comparisons = []
-
-            for query, (_, row) in zip(
-                query_embeddings,
-                query_metadata.iterrows(),
-            ):
-                start = time.perf_counter()
-
-                indices, scores = search_one(
-                    method,
-                    query,
-                    gallery_embeddings,
-                    top_k=top_k,
-                    lsh=lsh,
-                    hnsw=hnsw,
-                )
-
-                latency = (
-                    time.perf_counter() - start
-                ) * 1000
-
-                latencies.append(latency)
-
-                if len(indices):
-                    best_index = int(indices[0])
-                    best_score = float(scores[0])
-
-                    if best_score >= threshold:
-                        predicted_identity = (
-                            gallery_metadata.iloc[
-                                best_index
-                            ]["identity"]
-                        )
-                    else:
-                        predicted_identity = -1
-                else:
-                    best_score = -np.inf
-                    predicted_identity = -1
-
-                predictions.append(
-                    predicted_identity
-                )
-
-                true_identity = row["identity"]
-                true_ids.append(true_identity)
-
-                known_flags.append(
-                    int(
-                        true_identity in gallery_ids
-                    )
-                )
-
-                comparisons.append(
-                    len(indices)
-                )
-
-            # ------------------------------------------------
-            # Metrics
-            # ------------------------------------------------
-
-            predictions_array = np.array(
-                predictions,
-                dtype=object,
-            )
-
-            true_ids_array = np.array(
-                true_ids,
-                dtype=object,
-            )
-
-            known_flags_array = np.array(
-                known_flags,
-                dtype=int,
-            )
-
-            baks, baus, geomean = calculate_metrics(
-                predictions_array,
-                true_ids_array,
-                known_flags_array,
-            )
-
-            latency_array = np.array(
-                latencies
-            )
-
-            avg_latency = float(
-                np.mean(latency_array)
-            )
-
-            p95_latency = float(
-                np.percentile(
-                    latency_array,
-                    95,
-                )
-            )
-
-            qps = (
-                1000.0 / avg_latency
-                if avg_latency > 0
-                else 0.0
-            )
-
-            avg_comparisons = float(
-                np.mean(comparisons)
-            )
-
-            index_size = get_directory_size_mb(
-                gallery_dir
-            )
-
-            # ------------------------------------------------
-            # Build times
-            # ------------------------------------------------
-
-            with open(
-                gallery_dir / "configuration.json",
-                "r",
-                encoding="utf-8",
-            ) as f:
-                index_config = json.load(f)
-
-            lsh_build_time = index_config.get(
-                "lsh",
-                {},
-            ).get(
-                "build_time_s",
-                np.nan,
-            )
-
-            hnsw_build_time = index_config.get(
-                "hnsw",
-                {},
-            ).get(
-                "build_time_s",
-                np.nan,
-            )
-
-            if method == "LSH":
-                build_time = lsh_build_time
-            elif method == "HNSW":
-                build_time = hnsw_build_time
-            else:
-                build_time = 0.0
-
-            results.append(
-                {
-                    "gallery_fraction": fraction,
-                    "gallery_size": len(
-                        gallery_embeddings
-                    ),
-                    "method": method,
-                    "top_k": top_k,
+            if OPEN_SET_THRESHOLD is not None:
+                threshold = float(OPEN_SET_THRESHOLD)
+                calibration = {
                     "threshold": threshold,
-                    "baks": baks,
-                    "baus": baus,
-                    "geomean": geomean,
-                    "avg_latency_ms": avg_latency,
-                    "p95_latency_ms": p95_latency,
-                    "qps": qps,
-                    "comparisons": avg_comparisons,
-                    "index_build_time_s": build_time,
-                    "index_size_mb": index_size,
+                    "known_count": np.nan,
+                    "unknown_count": np.nan,
+                    "calibration_geomean": np.nan,
                 }
+            else:
+                calibration = calibrate_threshold(
+                    method,
+                    gallery,
+                    gallery_metadata,
+                    validation_embeddings,
+                    lsh=lsh_object,
+                    hnsw=hnsw_object,
+                )
+                threshold = calibration["threshold"]
+
+            print(f"  Evaluating {len(test_embeddings):,} test queries...")
+
+            metrics = evaluate_method(
+                method,
+                gallery,
+                gallery_metadata,
+                test_embeddings,
+                test_metadata,
+                threshold,
+                lsh=lsh_object,
+                hnsw=hnsw_object,
             )
 
-            print(
-                f"    threshold={threshold:.4f} | "
-                f"BAKS={baks:.4f} | "
-                f"BAUS={baus:.4f} | "
-                f"latency={avg_latency:.3f} ms | "
-                f"QPS={qps:.2f}"
-            )
+            result = {
+                "gallery_fraction": fraction,
+                "gallery_size": gallery_size,
+                "method": method,
+                "top_k": TOP_K,
+                "threshold": threshold,
+                **metrics,
+                "index_build_time_s": build_time,
+                "index_size_mb": index_size_mb,
+                "calibration_known": calibration["known_count"],
+                "calibration_unknown": calibration["unknown_count"],
+                "calibration_geomean": calibration["calibration_geomean"],
+            }
+            all_results.append(result)
 
-    # ========================================================
-    # Save Results
-    # ========================================================
+            print(f"  Threshold : {threshold:.6f}")
+            print(f"  Top-1     : {metrics['top1']:.4f}")
+            print(f"  Top-5     : {metrics['top5']:.4f}")
+            print(f"  BAKS      : {metrics['baks']:.4f}")
+            print(f"  BAUS      : {metrics['baus']:.4f}")
+            print(f"  GeoMean   : {metrics['geomean']:.4f}")
+            print(f"  AUROC     : {metrics['auroc']:.4f}")
+            print(f"  Recall@{TOP_K}: {metrics['recall_at_k']:.4f}")
+            print(f"  Avg latency: {metrics['avg_latency_ms']:.4f} ms")
+            print(f"  P95 latency: {metrics['p95_latency_ms']:.4f} ms")
+            print(f"  QPS       : {metrics['qps']:.2f}")
+            print(f"  Comparisons: {metrics['comparisons']}")
+            print(f"  Index size: {index_size_mb:.2f} MB")
+            print(f"  Build time: {build_time:.4f} s")
 
-    results_df = pd.DataFrame(results)
+    results_df = pd.DataFrame(all_results)
 
-    output_csv = (
-        result_root / "finetuned_results.csv"
-    )
+    results_path = RESULT_DIR / f"{EMBEDDING_MODE}_evaluation.csv"
+    results_df.to_csv(results_path, index=False)
 
-    results_df.to_csv(
-        output_csv,
-        index=False,
-    )
-
-    evaluation_configuration = {
-        "seed": seed,
-        "embedding_mode": embedding_mode,
-        "embedding_dimension": model_cfg[
-            "embedding_dim"
-        ],
-        "normalize_embeddings": model_cfg.get(
-            "normalize_embeddings",
-            True,
-        ),
-        "top_k": top_k,
-        "gallery_fractions": gallery_fractions,
-        "open_set": open_set_cfg,
-        "evaluation_metrics": evaluation_cfg[
-            "metrics"
-        ],
-        "lsh": lsh_cfg,
-        "hnsw": hnsw_cfg,
-    }
-
-    with open(
-        result_root / "evaluation_configuration.json",
-        "w",
+    json_path = RESULT_DIR / f"{EMBEDDING_MODE}_evaluation.json"
+    json_path.write_text(
+        json.dumps(all_results, indent=2, allow_nan=True),
         encoding="utf-8",
-    ) as f:
-        json.dump(
-            evaluation_configuration,
-            f,
-            indent=2,
-        )
+    )
 
-    print()
-    print("=" * 60)
+    print("\n" + "=" * 70)
     print("EVALUATION COMPLETE")
-    print("=" * 60)
-    print(f"Results: {output_csv}")
+    print("=" * 70)
+
+    columns = [
+        "gallery_fraction", "gallery_size", "method", "threshold",
+        "top1", "top5", "baks", "baus", "geomean", "auroc",
+        "recall_at_k", "avg_latency_ms", "p95_latency_ms", "qps",
+        "comparisons", "index_build_time_s", "index_size_mb",
+    ]
+
+    print(results_df[columns].to_string(index=False))
+    print(f"\nCSV saved to: {results_path}")
+    print(f"JSON saved to: {json_path}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nEvaluation interrupted by user.")
+        sys.exit(1)
+    except Exception as e:
+        print("\n" + "=" * 70)
+        print("ERROR")
+        print("=" * 70)
+        print(e)
+        sys.exit(1)
