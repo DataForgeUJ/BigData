@@ -13,19 +13,33 @@ export default function ProcessingPanel() {
   useEffect(() => {
     // TODO: Replace this timer with progress from the live API if it exposes job updates.
     // In demo mode these steps are only a visual wait.
-    const timer = window.setInterval(() => setStage((current) => Math.min(current + 1, STAGES.length - 1)), 430);
+    const timer = window.setInterval(() => {
+      setStage((current) => Math.min(current + 1, STAGES.length - 1));
+    }, 430);
+
     return () => window.clearInterval(timer);
   }, []);
 
   return (
-    <section className="processing-panel" aria-live="polite" aria-busy="true">
-      <div className="processing-orbit" aria-hidden="true"><span /></div>
+    <section
+      className="processing-panel"
+      aria-live="polite"
+      aria-busy="true"
+    >
+      <div className="processing-orbit" aria-hidden="true">
+        <span />
+      </div>
       <div>
         <p className="eyebrow">Identification in progress</p>
         <h2>{STAGES[stage][0]}</h2>
         <p>{STAGES[stage][1]}</p>
         <div className="stage-track" aria-hidden="true">
-          {STAGES.map((item, index) => <span className={index <= stage ? 'stage-dot stage-dot--active' : 'stage-dot'} key={item[0]} />)}
+          {STAGES.map((item, index) => (
+            <span
+              className={index <= stage ? 'stage-dot stage-dot--active' : 'stage-dot'}
+              key={item[0]}
+            />
+          ))}
         </div>
       </div>
     </section>

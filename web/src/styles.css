@@ -57,8 +57,11 @@ h1, h2, h3, p { margin-top: 0; }
 .site-header nav { display: flex; align-items: center; gap: 30px; }
 .site-header nav a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 650; }
 .site-header nav a:hover { color: var(--forest); }
-.research-tag { justify-self: end; padding: 7px 10px; color: var(--forest); border: 1px solid var(--line-strong); border-radius: 100px; text-transform: uppercase; letter-spacing: .08em; font-size: 9px; font-weight: 800; }
 
+
+.research-tag {
+  justify-self: end;
+}
 .hero {
   width: min(100% - 40px, 1320px);
   min-height: 650px;
