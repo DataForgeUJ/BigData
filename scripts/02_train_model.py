@@ -11,7 +11,7 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 
-from src.data.dataset import load_dataset, get_transform, TripletDataset
+from src.data.dataset import load_dataset, get_train_transform, TripletDataset
 from src.models.embedding_model import EmbeddingModel
 
 
@@ -109,8 +109,9 @@ def main():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.benchmark = True
 
-    train_file = Path(data_cfg["processed_dir"]) / "train.csv"
-    validation_file = Path(data_cfg["processed_dir"]) / "validation.csv"
+    splits_dir = Path(data_cfg["splits_dir"])
+    train_file = splits_dir / "train.csv"
+    validation_file = splits_dir / "validation.csv"
     dataset_dir = Path(data_cfg["root"])
 
     checkpoint_dir = Path("artifacts/checkpoints")
@@ -153,7 +154,7 @@ def main():
     print(f"Train records:       {len(train_records):,}")
     print(f"Validation records:  {len(validation_records):,}")
 
-    transform = get_transform()
+    transform = get_train_transform(data_cfg["image_size"])
 
     train_dataset = TripletDataset(train_records, transform)
     validation_dataset = TripletDataset(validation_records, transform)

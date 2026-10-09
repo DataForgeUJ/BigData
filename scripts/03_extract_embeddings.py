@@ -167,13 +167,13 @@ def main():
     normalize = model_cfg.get("normalize_embeddings", True)
 
     data_root = Path(data_cfg["root"])
-    processed_dir = Path(data_cfg["processed_dir"])
+    splits_dir = Path(data_cfg["splits_dir"])
     output_dir = Path(data_cfg["embeddings_dir"]) / mode
 
     datasets = [
-        ("train", processed_dir / "train.csv"),
-        ("validation", processed_dir / "validation.csv"),
-        ("test", processed_dir / "test.csv"),
+        ("train", splits_dir / "train.csv"),
+        ("validation", splits_dir / "validation.csv"),
+        ("test", splits_dir / "test.csv"),
     ]
 
     device = torch.device(

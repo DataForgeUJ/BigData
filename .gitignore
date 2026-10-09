@@ -6,6 +6,8 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 .DS_Store
+node_modules/
+dist/
 
 # Large/local data
 data/raw/*
