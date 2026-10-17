@@ -1,0 +1,20 @@
+# Same-species batch-hard refinement experiment
+
+# Start from the batch-hard model that was already evaluated.
+initial_checkpoint: artifacts/checkpoints/batch_hard/best_resnet50_controlled.pth
+
+# Save this experiment separately so the existing model is never overwritten.
+output_dir: artifacts/checkpoints/species_batch_hard
+
+# P x K sampling:
+# 8 different identities from one species, 4 images per identity.
+identities_per_batch: 8
+images_per_identity: 4
+
+# Training settings.
+batches_per_epoch: 1000
+validation_batches: 100
+epochs: 8
+learning_rate: 0.00003
+margin: 0.3
+num_workers: 2
