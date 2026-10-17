@@ -38,7 +38,7 @@ def create_model(device, mode, model_cfg):
     if mode == "frozen":
         model = resnet50(weights=ResNet50_Weights.DEFAULT)
 
-    elif mode == "finetuned":
+    elif mode in ["finetuned", "batch_hard"]:
         checkpoint = Path(model_cfg["checkpoint"])
 
         if not checkpoint.exists():
@@ -54,7 +54,7 @@ def create_model(device, mode, model_cfg):
 
     model.fc = torch.nn.Identity()
 
-    if mode == "finetuned":
+    if mode in ["finetuned", "batch_hard"]:
         state_dict = torch.load(
             checkpoint,
             map_location=device,
@@ -156,7 +156,7 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["frozen", "finetuned"],
+        choices=["frozen", "finetuned", "batch_hard"],
         default=data_cfg.get("embedding_mode", "finetuned"),
     )
     args = parser.parse_args()
